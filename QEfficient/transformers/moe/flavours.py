@@ -93,9 +93,9 @@ def build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
     # workaround for ConstantOfShape(INT32_MAX); both produce identical traced Ctx ops.
     matched_idx = int32_max_scalar.expand_as(token_idx)
     matched_idx = ctx_scatter_3d_int(
-        matched_idx.unsqueeze(-1),
-        scatter_pos,
-        token_idx.unsqueeze(-1),
+        matched_idx.unsqueeze(-1).to(torch.int32),
+        scatter_pos.to(torch.int32),
+        token_idx.unsqueeze(-1).to(torch.int32),
     ).squeeze(-1)
     return matched_idx
 

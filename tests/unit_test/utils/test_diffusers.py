@@ -89,6 +89,104 @@ class TestDiffusersModuleImportability:
 
         assert QEfficient.diffusers.models.transformers.transformer_flux is not None
 
+    def test_transformer_llada_image_importable(self):
+        import QEfficient.diffusers.models.transformers.transformer_llada_image
+
+        assert QEfficient.diffusers.models.transformers.transformer_llada_image is not None
+
+    def test_pipeline_llada_image_importable(self):
+        import QEfficient.diffusers.pipelines.llada_image
+
+        assert QEfficient.diffusers.pipelines.llada_image is not None
+
+    def test_llada_image_vae_decoder_importable(self):
+        from QEfficient.diffusers.pipelines.llada_image import (
+            QEffLLaDAImageVAEDecoder,
+            QEffLLaDAImageVAEEncoder,
+        )
+
+        assert QEffLLaDAImageVAEDecoder is not None
+        assert QEffLLaDAImageVAEEncoder is not None
+
+    def test_llada_image_composite_encoder_importable(self):
+        from QEfficient.diffusers.pipelines.llada_image import (
+            CAPTION_LENGTH,
+            PROMPT_LENGTH,
+            QEffLLaDAImageCompositeTextEncoder,
+            QEffTurboCompositeTextEncoder,
+        )
+
+        assert (PROMPT_LENGTH, CAPTION_LENGTH) == (256, 512)
+        assert QEffTurboCompositeTextEncoder is QEffLLaDAImageCompositeTextEncoder
+
+    def test_llada_image_composite_encoder_graph_contract(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image import LLaDAImageCompositeTextEncoderGraph
+
+        class QueryFormer(torch.nn.Module):
+            config = SimpleNamespace(num_queries=256)
+
+            def forward(self, inputs_embeds, _attention_mask, return_dict=False):
+                del return_dict
+                return (torch.zeros(inputs_embeds.shape[0], 256, inputs_embeds.shape[-1]),)
+
+        class LLaDA2(torch.nn.Module):
+            config = SimpleNamespace(hidden_size=4)
+
+            def forward(self, inputs_embeds, _attention_mask, _position_ids):
+                return inputs_embeds
+
+        class TextProjection(torch.nn.Module):
+            def forward(self, hidden_states, attention_mask=None, return_dict=False):
+                del attention_mask, return_dict
+                return (hidden_states,)
+
+        graph = LLaDAImageCompositeTextEncoderGraph(QueryFormer(), LLaDA2(), TextProjection())
+        prompt_mask = torch.zeros(1, 256, dtype=torch.bool)
+        prompt_mask[:, :37] = True
+        output = graph(torch.randn(1, 256, 4), prompt_mask)
+
+        assert output.shape == (1, 512, 4)
+
+    def test_composite_encoder_reuses_pipeline_components(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import QEfficient.diffusers.pipelines.llada_image.composite_encoder_module as composite_module
+
+        class Component(torch.nn.Module):
+            def __init__(self, **config):
+                super().__init__()
+                self.config = SimpleNamespace(**config)
+
+        queryformer = Component(num_queries=256)
+        text_encoder = Component(hidden_size=4)
+        text_projection = Component()
+
+        def fail_if_loaded(*_args, **_kwargs):
+            raise AssertionError("fused encoder attempted to load a duplicate component")
+
+        monkeypatch.setattr(composite_module.LLaDAImageQueryFormerModel, "from_pretrained", fail_if_loaded)
+        monkeypatch.setattr(composite_module.LLaDAImageTextProjectionModel, "from_pretrained", fail_if_loaded)
+        monkeypatch.setattr(composite_module.AutoModel, "from_pretrained", fail_if_loaded)
+        monkeypatch.setattr(
+            composite_module.llada2.LLaDA2MoeTransform,
+            "apply",
+            lambda model: (model, True),
+        )
+
+        adapter = composite_module.QEffLLaDAImageCompositeTextEncoder.from_pretrained(
+            "/tmp/llada-image",
+            queryformer=queryformer,
+            text_encoder=text_encoder,
+            text_projection=text_projection,
+        )
+
+        assert adapter.reuse_pipeline_components
+        assert adapter.model.queryformer is queryformer
+        assert adapter.model.llada2.backbone is text_encoder
+        assert adapter.model.text_projection is text_projection
+
     def test_pipeline_utils_importable(self):
         import QEfficient.diffusers.pipelines.pipeline_utils
 
@@ -123,6 +221,563 @@ class TestDiffusersModuleImportability:
         from QEfficient.diffusers.pipelines.pipeline_utils import QEffPipelineOutput
 
         assert QEffPipelineOutput is not None
+
+
+@pytest.mark.diffusers
+class TestLLaDAImageComponents:
+    """LLaDA-Image components must execute their native PyTorch CPU paths."""
+
+    def test_queryformer_aic_session_uses_compiled_sequence_length(self, monkeypatch):
+        import numpy as np
+
+        from QEfficient.diffusers.pipelines.llada_image.pipeline_module import LLaDAImageQueryFormerAICSession
+
+        class Binding:
+            def __init__(self, name, dims, dtype):
+                self.name = name
+                self.dims = dims
+                self.type = dtype
+
+        class FakeSession:
+            def __init__(self, _qpc_path, device_ids=None):
+                del device_ids
+                self.binding_index_map = {
+                    "inputs_embeds": 0,
+                    "attention_mask": 1,
+                    "query_embeds": 2,
+                }
+                self.bindings = [
+                    Binding("inputs_embeds", [1, 512, 8], 0),
+                    Binding("attention_mask", [1, 512], 1),
+                    Binding("query_embeds", [1, 3, 8], 0),
+                ]
+                self.aic_to_np_dtype_mapping = {0: np.dtype(np.float32), 1: np.dtype(np.int8)}
+                self.buffers = {}
+
+            def set_buffers(self, buffers):
+                self.buffers.update(buffers)
+
+            def run(self, inputs):
+                assert inputs["inputs_embeds"].shape == (1, 512, 8)
+                assert inputs["attention_mask"].shape == (1, 512)
+                return {"query_embeds": np.zeros((1, 3, 8), dtype=np.float32)}
+
+            def deactivate(self):
+                pass
+
+        monkeypatch.setattr(
+            "QEfficient.generation.cloud_infer.QAICInferenceSession",
+            FakeSession,
+        )
+        session = LLaDAImageQueryFormerAICSession(
+            "queryformer.qpc",
+            input_length=256,
+            hidden_size=8,
+            num_queries=3,
+        )
+
+        assert session.input_length == 512
+        output = session.run(torch.zeros(1, 512, 8), torch.ones(1, 512, dtype=torch.bool))
+        assert output.shape == (1, 3, 8)
+        session.close()
+
+    def test_text_projector_aic_session_passes_attention_mask(self, monkeypatch):
+        import numpy as np
+
+        from QEfficient.diffusers.pipelines.llada_image.pipeline_module import LLaDAImageTextProjectorAICSession
+
+        class Binding:
+            def __init__(self, name, dims, dtype):
+                self.name = name
+                self.dims = dims
+                self.type = dtype
+
+        class FakeSession:
+            def __init__(self, _qpc_path, device_ids=None):
+                del device_ids
+                self.binding_index_map = {
+                    "attention_mask": 0,
+                    "hidden_states": 1,
+                    "projected_hidden_states": 2,
+                }
+                self.bindings = [
+                    Binding("attention_mask", [1, 7], 1),
+                    Binding("hidden_states", [1, 7, 8], 0),
+                    Binding("projected_hidden_states", [1, 7, 6], 0),
+                ]
+                self.aic_to_np_dtype_mapping = {0: np.dtype(np.float32), 1: np.dtype(np.int8)}
+
+            def set_buffers(self, _buffers):
+                pass
+
+            def run(self, inputs):
+                assert inputs["hidden_states"].shape == (1, 7, 8)
+                assert inputs["attention_mask"].dtype == np.int8
+                np.testing.assert_array_equal(inputs["attention_mask"], [[1, 1, 1, 1, 0, 0, 0]])
+                return {"projected_hidden_states": np.zeros((1, 7, 6), dtype=np.float32)}
+
+            def deactivate(self):
+                pass
+
+        monkeypatch.setattr("QEfficient.generation.cloud_infer.QAICInferenceSession", FakeSession)
+        session = LLaDAImageTextProjectorAICSession(
+            "text-projector.qpc",
+            sequence_length=7,
+            hidden_size=8,
+            projection_dim=6,
+        )
+
+        output = session.run(
+            torch.zeros(1, 7, 8),
+            torch.tensor([[True, True, True, True, False, False, False]]),
+        )
+
+        assert output.shape == (1, 7, 6)
+        session.close()
+
+    def test_tiny_components_forward_on_cpu(self):
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+            LLaDAImageQueryFormerModel,
+            LLaDAImageSigVQModel,
+            LLaDAImageTextProjectionModel,
+            LLaDAImageTransformer2DModel,
+        )
+
+        queryformer = LLaDAImageQueryFormerModel(
+            num_queries=3,
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+        )
+        projection = LLaDAImageTextProjectionModel(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            projection_dim=6,
+        )
+        sigvq = LLaDAImageSigVQModel(
+            image_size=8,
+            patch_size=2,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            codebook_size=8,
+            codebook_embed_dim=4,
+            semantic_embed_dim=6,
+        )
+        transformer = LLaDAImageTransformer2DModel(
+            in_channels=4,
+            dim=12,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=2,
+            cap_feat_dim=6,
+            semantic_feat_dim=6,
+            axes_dims=(2, 2, 2),
+            axes_lens=(64, 8, 8),
+        )
+
+        inputs_embeds = torch.randn(1, 4, 8)
+        attention_mask = torch.ones(1, 4, dtype=torch.bool)
+        query_output = queryformer(inputs_embeds, attention_mask)
+        assert query_output.query_embeds.shape == (1, 3, 8)
+
+        projection_output = projection(torch.randn(1, 4, 8))
+        assert projection_output.hidden_states.shape == (1, 4, 6)
+
+        sigvq_output = sigvq(pixel_values=torch.randn(1, 3, 4, 4))
+        assert sigvq_output.semantic_features.shape == (1, 4, 6)
+        assert sigvq_output.token_ids.shape == (1, 4)
+
+        transformer_output = transformer(
+            x=[torch.randn(4, 1, 2, 2)],
+            t=torch.ones(1),
+            cap_feats=[torch.randn(3, 6)],
+        )
+        assert len(transformer_output.sample) == 1
+        assert transformer_output.sample[0].shape == (4, 1, 2, 2)
+
+    def test_qeff_dit_hierarchy_preserves_reference_output(self):
+        import copy
+
+        from QEfficient.diffusers.models.pytorch_transforms import LLaDAImageTransformerTransform
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+            LLaDAImageTransformer2DModel,
+            QEffLLaDAImageDenoisingGraph,
+            QEffLLaDAImageTransformer2DModel,
+            QEffLLaDAImageTransformerBlock,
+        )
+        from QEfficient.diffusers.pipelines.pipeline_module import QEffLLaDAImageTransformer
+
+        reference = LLaDAImageTransformer2DModel(
+            in_channels=4,
+            dim=24,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=3,
+            cap_feat_dim=8,
+            semantic_feat_dim=8,
+            axes_dims=(4, 2, 2),
+            axes_lens=(96, 8, 8),
+        ).eval()
+        transformed = copy.deepcopy(reference)
+        transformed, did_transform = LLaDAImageTransformerTransform.apply(transformed)
+
+        assert did_transform
+        assert isinstance(transformed, QEffLLaDAImageTransformer2DModel)
+        assert all(isinstance(block, QEffLLaDAImageTransformerBlock) for block in transformed.layers)
+        graph = QEffLLaDAImageDenoisingGraph(
+            transformed,
+            mode="text",
+            latent_height=2,
+            latent_width=2,
+            caption_length=4,
+        )
+        assert graph.get_submodules_for_export() == {QEffLLaDAImageTransformerBlock}
+        assert QEffLLaDAImageTransformer._pytorch_transforms[0] is LLaDAImageTransformerTransform
+
+        inputs = {
+            "x": [torch.randn(4, 1, 2, 2)],
+            "t": torch.ones(1),
+            "cap_feats": [torch.randn(3, 8)],
+        }
+        with torch.no_grad():
+            reference_output = reference(**inputs).sample[0]
+            transformed_output = transformed(**inputs).sample[0]
+        torch.testing.assert_close(transformed_output, reference_output, rtol=1e-5, atol=1e-5)
+
+    def test_qeff_component_hierarchies_preserve_reference_outputs(self):
+        import copy
+
+        from QEfficient.diffusers.models.pytorch_transforms import LLaDAImageComponentTransform
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+            LLaDAImageQueryFormerModel,
+            LLaDAImageSigVQModel,
+            LLaDAImageTextProjectionModel,
+            QEffLLaDAImageQueryAttnProcessor,
+            QEffLLaDAImageQueryFormerBlock,
+            QEffLLaDAImageQueryFormerModel,
+            QEffLLaDAImageSigVQAttention,
+            QEffLLaDAImageSigVQAttnProcessor,
+            QEffLLaDAImageSigVQModel,
+            QEffLLaDAImageSigVQVisionBlock,
+            QEffLLaDAImageTextProjectionAttnProcessor,
+            QEffLLaDAImageTextProjectionBlock,
+            QEffLLaDAImageTextProjectionModel,
+        )
+        from QEfficient.diffusers.pipelines.llada_image.component_module import (
+            QEffLLaDAImageComponent,
+            QEffLLaDAImageComponentGraph,
+        )
+
+        torch.manual_seed(0)
+
+        queryformer = LLaDAImageQueryFormerModel(
+            num_queries=3,
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+        ).eval()
+        queryformer_qeff = copy.deepcopy(queryformer)
+        queryformer_qeff, transformed = LLaDAImageComponentTransform.apply(queryformer_qeff)
+        assert transformed
+        assert isinstance(queryformer_qeff, QEffLLaDAImageQueryFormerModel)
+        assert isinstance(queryformer_qeff.query_blocks[0], QEffLLaDAImageQueryFormerBlock)
+        assert isinstance(queryformer_qeff.query_blocks[0].cross_attn.processor, QEffLLaDAImageQueryAttnProcessor)
+
+        query_inputs = torch.randn(1, 4, 8)
+        query_mask = torch.ones(1, 4, dtype=torch.bool)
+        with torch.no_grad():
+            query_reference = queryformer(query_inputs, query_mask).query_embeds
+            query_actual = queryformer_qeff(query_inputs, query_mask).query_embeds
+        torch.testing.assert_close(query_actual, query_reference, rtol=1e-5, atol=1e-5)
+
+        text_projection = LLaDAImageTextProjectionModel(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            projection_dim=6,
+        ).eval()
+        text_projection_qeff = copy.deepcopy(text_projection)
+        text_projection_qeff, transformed = LLaDAImageComponentTransform.apply(text_projection_qeff)
+        assert transformed
+        assert isinstance(text_projection_qeff, QEffLLaDAImageTextProjectionModel)
+        assert isinstance(text_projection_qeff.layers[0], QEffLLaDAImageTextProjectionBlock)
+        assert isinstance(
+            text_projection_qeff.layers[0].self_attn.processor,
+            QEffLLaDAImageTextProjectionAttnProcessor,
+        )
+
+        projection_inputs = torch.randn(1, 4, 8)
+        with torch.no_grad():
+            projection_reference = text_projection(projection_inputs).hidden_states
+            projection_actual = text_projection_qeff(projection_inputs).hidden_states
+        torch.testing.assert_close(projection_actual, projection_reference, rtol=1e-5, atol=1e-5)
+
+        sigvq = LLaDAImageSigVQModel(
+            image_size=8,
+            patch_size=2,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            codebook_size=8,
+            codebook_embed_dim=4,
+            semantic_embed_dim=6,
+        ).eval()
+        sigvq_qeff = copy.deepcopy(sigvq)
+        sigvq_qeff, transformed = LLaDAImageComponentTransform.apply(sigvq_qeff)
+        assert transformed
+        assert isinstance(sigvq_qeff, QEffLLaDAImageSigVQModel)
+        assert isinstance(sigvq_qeff.visual.blocks[0], QEffLLaDAImageSigVQVisionBlock)
+        assert isinstance(sigvq_qeff.visual.blocks[0].attn, QEffLLaDAImageSigVQAttention)
+        assert isinstance(sigvq_qeff.visual.blocks[0].attn.processor, QEffLLaDAImageSigVQAttnProcessor)
+
+        sigvq_inputs = torch.randn(1, 3, 4, 4)
+        with torch.no_grad():
+            sigvq_reference = sigvq(pixel_values=sigvq_inputs)
+            sigvq_actual = sigvq_qeff(pixel_values=sigvq_inputs)
+        torch.testing.assert_close(
+            sigvq_actual.semantic_features,
+            sigvq_reference.semantic_features,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(sigvq_actual.token_ids, sigvq_reference.token_ids)
+
+        component_wrapper = QEffLLaDAImageComponent(copy.deepcopy(queryformer), component="queryformer")
+        assert QEffLLaDAImageComponent._pytorch_transforms[0] is LLaDAImageComponentTransform
+        assert isinstance(component_wrapper.model, QEffLLaDAImageComponentGraph)
+        assert isinstance(component_wrapper.model.model, QEffLLaDAImageQueryFormerModel)
+
+    def test_qeff_pipeline_is_a_deployment_wrapper(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image.pipeline_llada_image import (
+            LLaDAImagePipeline,
+            QEffLLaDAImagePipeline,
+        )
+
+        wrapper = object.__new__(QEffLLaDAImagePipeline)
+        wrapper.model = SimpleNamespace()
+        wrapper.modules = {}
+        wrapper.sessions = {}
+        wrapper.custom_config = None
+        wrapper.onnx_paths = {}
+
+        fake_module = SimpleNamespace(export=lambda **_: None, compile=lambda **_: None)
+        assert wrapper.register_module("dit", fake_module) is fake_module
+        assert wrapper.modules == {"dit": fake_module}
+        assert hasattr(wrapper, "export")
+        assert hasattr(wrapper, "compile")
+        assert QEffLLaDAImagePipeline._reference_pipeline_cls is LLaDAImagePipeline
+        assert QEffLLaDAImagePipeline is not LLaDAImagePipeline
+
+        session = object()
+        wrapper.dit_session = session
+        wrapper.stage_device_sessions = True
+        assert wrapper.model.dit_session is session
+        assert wrapper.model.stage_device_sessions is True
+
+    def test_text_projection_mask_preserves_unpadded_prefix(self):
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+            LLaDAImageTextProjectionModel,
+        )
+
+        projection = LLaDAImageTextProjectionModel(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            projection_dim=6,
+        ).eval()
+        hidden_states = torch.randn(1, 4, 8)
+        padded_hidden_states = torch.zeros(1, 7, 8)
+        padded_hidden_states[:, :4] = hidden_states
+        attention_mask = torch.tensor([[True, True, True, True, False, False, False]])
+
+        with torch.no_grad():
+            expected = projection(hidden_states).hidden_states
+            actual = projection(padded_hidden_states, attention_mask=attention_mask).hidden_states[:, :4]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_cpu_text_projector_receives_fixed_length_attention_mask(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image.pipeline_llada_image import LLaDAImagePipeline
+
+        class Tokenizer:
+            def __call__(self, *_args, **_kwargs):
+                return SimpleNamespace(
+                    input_ids=torch.tensor([[1, 2]]),
+                    attention_mask=torch.tensor([[1, 1]]),
+                )
+
+        class TextEncoder:
+            device = torch.device("cpu")
+
+            @staticmethod
+            def get_input_embeddings():
+                return lambda input_ids: torch.nn.functional.one_hot(input_ids, num_classes=4).float()
+
+        class QueryFormerSession:
+            input_length = 4
+
+            @staticmethod
+            def run(_inputs_embeds, _attention_mask):
+                return torch.zeros(1, 1, 4)
+
+        class LLaDA2Session:
+            sequence_length = 5
+
+            @staticmethod
+            def text(inputs_embeds, _attention_mask, _position_ids):
+                return inputs_embeds
+
+        class TextProjector:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+            def __init__(self):
+                self.attention_mask = None
+
+            def __call__(self, hidden_states, attention_mask=None):
+                self.attention_mask = attention_mask
+                return SimpleNamespace(hidden_states=hidden_states)
+
+        text_projector = TextProjector()
+        pipeline = SimpleNamespace(
+            tokenizer=Tokenizer(),
+            text_encoder=TextEncoder(),
+            composite_text_encoder_session=None,
+            component_timings=None,
+            queryformer_session=QueryFormerSession(),
+            llada2_text_session=LLaDA2Session(),
+            text_projection_session=None,
+            text_projection=text_projector,
+        )
+
+        prompt_embeds, attention_mask = LLaDAImagePipeline._encode_text(pipeline, ["prompt"], 2)
+
+        expected_mask = torch.tensor([[True, True, True, False, False]])
+        torch.testing.assert_close(text_projector.attention_mask, expected_mask)
+        torch.testing.assert_close(attention_mask, expected_mask)
+        assert prompt_embeds.shape == (1, 5, 4)
+
+    def test_aic_denoising_keeps_host_embeddings_off_meta_device(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image.pipeline_llada_image import LLaDAImagePipeline
+
+        class Scheduler:
+            config = {"num_train_timesteps": 1000}
+
+            def set_timesteps(self, sigmas, device):
+                del sigmas
+                self.timesteps = [torch.tensor(500.0, device=device)]
+
+            @staticmethod
+            def step(model_output, _timestep, latents, return_dict=False):
+                del model_output, return_dict
+                return (latents,)
+
+        class DenoisingSession:
+            caption_length = 4
+            semantic_length = 0
+
+            @staticmethod
+            def run(hidden_states, *_args):
+                return torch.zeros_like(hidden_states)
+
+        class ProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def update(self):
+                pass
+
+        pipeline = object.__new__(LLaDAImagePipeline)
+        pipeline.scheduler = Scheduler()
+        pipeline.transformer = SimpleNamespace(
+            device=torch.device("meta"),
+            dtype=torch.float32,
+            config=SimpleNamespace(in_channels=4),
+        )
+        pipeline.dit_session = DenoisingSession()
+        pipeline.vae_decoder_session = object()
+        pipeline.vae = SimpleNamespace()
+        pipeline.latent_scale_factor = 2
+        pipeline.component_timings = None
+        pipeline.progress_bar = lambda total: ProgressBar()
+        pipeline.maybe_free_model_hooks = lambda: None
+
+        prompt_embeds = torch.randn(1, 3, 6)
+        prompt_attention_mask = torch.tensor([[True, True, False]])
+        output = LLaDAImagePipeline.__call__(
+            pipeline,
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            height=4,
+            width=4,
+            num_inference_steps=1,
+            guidance_scale=1.0,
+            output_type="latent",
+        )
+
+        assert output.images.device == torch.device("cpu")
+
+    def test_tiny_denoising_graph_supports_all_modes_on_cpu(self):
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+            LLaDAImageDenoisingGraph,
+            LLaDAImageTransformer2DModel,
+        )
+
+        transformer = LLaDAImageTransformer2DModel(
+            in_channels=4,
+            dim=24,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=3,
+            cap_feat_dim=8,
+            semantic_feat_dim=8,
+            axes_dims=(4, 2, 2),
+            axes_lens=(96, 8, 8),
+        ).eval()
+
+        for mode, semantic_length in (("text", 0), ("vq", 3), ("editing", 3)):
+            graph = LLaDAImageDenoisingGraph(
+                transformer,
+                mode=mode,
+                latent_height=2,
+                latent_width=2,
+                caption_length=4,
+                semantic_length=semantic_length,
+            ).eval()
+            inputs = {
+                "hidden_states": torch.randn(1, 4, 2, 2),
+                "timestep": torch.tensor([0.5]),
+                "cap_feats": torch.randn(1, 4, 8),
+                "cap_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.int64),
+            }
+            if mode in {"vq", "editing"}:
+                inputs["semantic_feats"] = torch.randn(1, semantic_length, 8)
+                inputs["semantic_mask"] = torch.tensor([[1, 1, 0]], dtype=torch.int64)
+            if mode == "editing":
+                inputs["source_latents"] = torch.randn(1, 4, 2, 2)
+
+            with torch.no_grad():
+                sample = graph(**inputs)
+            assert sample.shape == (1, 4, 2, 2)
+            assert torch.isfinite(sample).all()
 
 
 # ---------------------------------------------------------------------------
@@ -861,10 +1516,132 @@ class TestPipelineModuleStructure:
 
         assert QEffVAE is not None
 
+    def test_qeff_vae_uses_model_latent_channels(self):
+        from diffusers.models import AutoencoderKLFlux2
+
+        from QEfficient.diffusers.pipelines.llada_image import QEffLLaDAImageVAEDecoder
+        from QEfficient.diffusers.pipelines.pipeline_module import QEffVAE
+
+        vae = AutoencoderKLFlux2(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=32,
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            norm_num_groups=4,
+            sample_size=32,
+            patch_size=(2, 2),
+        )
+        vae.forward = lambda latent_sample, return_dict=False: vae.decode(latent_sample, return_dict=return_dict)
+        wrapper = QEffVAE(vae, "decoder")
+
+        example_inputs, dynamic_axes, output_names = wrapper.get_onnx_params(latent_height=32, latent_width=32)
+
+        assert example_inputs["latent_sample"].shape == (1, 32, 32, 32)
+        assert dynamic_axes["latent_sample"][1] == "channels"
+        assert output_names == ["sample"]
+
+        decoder = QEffLLaDAImageVAEDecoder(vae)
+        decoded = decoder.model(torch.randn(1, 32, 2, 2), return_dict=False)[0]
+        assert decoded.shape == (1, 3, 16, 16)
+
+    def test_llada_image_vae_encoder_uses_4d_image_contract(self):
+        from diffusers.models import AutoencoderKLFlux2
+
+        from QEfficient.diffusers.pipelines.llada_image import QEffLLaDAImageVAEEncoder
+
+        vae = AutoencoderKLFlux2(
+            in_channels=3,
+            out_channels=3,
+            latent_channels=32,
+            block_out_channels=(8, 8, 8, 8),
+            layers_per_block=1,
+            norm_num_groups=4,
+            sample_size=32,
+            patch_size=(2, 2),
+        )
+        encoder = QEffLLaDAImageVAEEncoder(vae)
+
+        example_inputs, dynamic_axes, output_names = encoder.get_onnx_params(height=32, width=32)
+
+        assert example_inputs["image"].shape == (1, 3, 32, 32)
+        assert dynamic_axes["image"] == {0: "batch_size", 2: "height", 3: "width"}
+        assert dynamic_axes["latents"] == {0: "batch_size", 2: "latent_height", 3: "latent_width"}
+        assert output_names == ["latents"]
+        assert encoder.model(torch.randn(1, 3, 32, 32)).shape == (1, 32, 4, 4)
+
     def test_qeff_flux_transformer_model_importable(self):
         from QEfficient.diffusers.pipelines.pipeline_module import QEffFluxTransformerModel
 
         assert QEffFluxTransformerModel is not None
+
+    def test_qeff_llada_image_transformer_matches_bfloat16_export_inputs(self):
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import LLaDAImageTransformer2DModel
+        from QEfficient.diffusers.pipelines.pipeline_module import QEffLLaDAImageTransformer
+
+        transformer = LLaDAImageTransformer2DModel(
+            in_channels=4,
+            dim=24,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=3,
+            cap_feat_dim=8,
+            semantic_feat_dim=8,
+            axes_dims=(4, 2, 2),
+            axes_lens=(96, 8, 8),
+        ).to(dtype=torch.bfloat16).eval()
+        wrapper = QEffLLaDAImageTransformer(
+            transformer,
+            mode="text",
+            latent_height=2,
+            latent_width=2,
+            caption_length=4,
+        )
+
+        example_inputs, _, _ = wrapper.get_onnx_params()
+
+        assert example_inputs["hidden_states"].dtype == torch.bfloat16
+        assert example_inputs["timestep"].dtype == torch.bfloat16
+        assert example_inputs["cap_feats"].dtype == torch.bfloat16
+        with torch.no_grad():
+            output = wrapper.model(**example_inputs)
+        assert output.dtype == torch.bfloat16
+        assert torch.isfinite(output).all()
+
+    def test_qeff_llada_image_transformer_dynamic_text_inputs(self):
+        from QEfficient.diffusers.models.transformers.transformer_llada_image import LLaDAImageTransformer2DModel
+        from QEfficient.diffusers.pipelines.pipeline_module import QEffLLaDAImageTransformer
+
+        transformer = LLaDAImageTransformer2DModel(
+            in_channels=4,
+            dim=24,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=3,
+            cap_feat_dim=8,
+            semantic_feat_dim=8,
+            axes_dims=(4, 2, 2),
+            axes_lens=(96, 8, 8),
+        ).eval()
+        wrapper = QEffLLaDAImageTransformer(
+            transformer,
+            mode="text",
+            latent_height=2,
+            latent_width=2,
+            caption_length=4,
+            dynamic_resolution=True,
+        )
+
+        example_inputs, dynamic_axes, _ = wrapper.get_onnx_params()
+
+        assert example_inputs["image_rope_cos"].shape == (4, 4)
+        assert example_inputs["caption_rope_cos"].shape == (4, 4)
+        assert dynamic_axes["hidden_states"] == {0: "batch_size", 2: "latent_height", 3: "latent_width"}
+        assert dynamic_axes["image_rope_cos"] == {0: "image_sequence_length"}
+        with torch.no_grad():
+            output = wrapper.model(**example_inputs)
+        assert output.shape == (1, 4, 2, 2)
+        assert torch.isfinite(output).all()
 
     def test_qeff_wan_unified_transformer_importable(self):
         from QEfficient.diffusers.pipelines.pipeline_module import QEffWanUnifiedTransformer

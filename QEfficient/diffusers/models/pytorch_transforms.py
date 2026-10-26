@@ -50,6 +50,32 @@ from QEfficient.diffusers.models.transformers.transformer_wan import (
     QEffWanAttnProcessor,
     QEffWanTransformer3DModel,
 )
+from QEfficient.diffusers.models.transformers.transformer_llada_image import (
+    LLaDAImageAttention,
+    LLaDAImageQueryAttention,
+    LLaDAImageQueryFormerBlock,
+    LLaDAImageQueryFormerModel,
+    LLaDAImageSigVQAttention,
+    LLaDAImageSigVQModel,
+    LLaDAImageSigVQVisionBlock,
+    LLaDAImageTextProjectionAttention,
+    LLaDAImageTextProjectionBlock,
+    LLaDAImageTextProjectionModel,
+    LLaDAImageTransformer2DModel,
+    LLaDAImageTransformerBlock,
+    QEffLLaDAImageAttention,
+    QEffLLaDAImageQueryAttention,
+    QEffLLaDAImageQueryFormerBlock,
+    QEffLLaDAImageQueryFormerModel,
+    QEffLLaDAImageSigVQAttention,
+    QEffLLaDAImageSigVQModel,
+    QEffLLaDAImageSigVQVisionBlock,
+    QEffLLaDAImageTextProjectionAttention,
+    QEffLLaDAImageTextProjectionBlock,
+    QEffLLaDAImageTextProjectionModel,
+    QEffLLaDAImageTransformer2DModel,
+    QEffLLaDAImageTransformerBlock,
+)
 from QEfficient.transformers.models.clip.modeling_clip import QEffCLIPTextTransformer
 
 
@@ -81,6 +107,40 @@ class AttentionTransform(ModuleMappingTransform):
         WanEncoder3d: QEffWanEncoder3d,
         WanResidualBlock: QEffWanResidualBlock,
         WanResample: QEffWanResample,
+    }
+
+
+class LLaDAImageAttentionTransform(ModuleMappingTransform):
+    """Replace LLaDA-Image attention with the QAIC-safe processor."""
+
+    _module_mapping = {
+        LLaDAImageAttention: QEffLLaDAImageAttention,
+    }
+
+
+class LLaDAImageTransformerTransform(ModuleMappingTransform):
+    """Apply the QEff LLaDA-Image DiT class hierarchy before export."""
+
+    _module_mapping = {
+        LLaDAImageTransformer2DModel: QEffLLaDAImageTransformer2DModel,
+        LLaDAImageTransformerBlock: QEffLLaDAImageTransformerBlock,
+        LLaDAImageAttention: QEffLLaDAImageAttention,
+    }
+
+
+class LLaDAImageComponentTransform(ModuleMappingTransform):
+    """Apply the QEff class hierarchy to exportable LLaDA-Image components."""
+
+    _module_mapping = {
+        LLaDAImageQueryFormerModel: QEffLLaDAImageQueryFormerModel,
+        LLaDAImageQueryFormerBlock: QEffLLaDAImageQueryFormerBlock,
+        LLaDAImageQueryAttention: QEffLLaDAImageQueryAttention,
+        LLaDAImageTextProjectionModel: QEffLLaDAImageTextProjectionModel,
+        LLaDAImageTextProjectionBlock: QEffLLaDAImageTextProjectionBlock,
+        LLaDAImageTextProjectionAttention: QEffLLaDAImageTextProjectionAttention,
+        LLaDAImageSigVQModel: QEffLLaDAImageSigVQModel,
+        LLaDAImageSigVQVisionBlock: QEffLLaDAImageSigVQVisionBlock,
+        LLaDAImageSigVQAttention: QEffLLaDAImageSigVQAttention,
     }
 
 

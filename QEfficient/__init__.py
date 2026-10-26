@@ -57,10 +57,12 @@ from QEfficient.utils.logging_utils import logger
 
 try:
     from QEfficient.diffusers.pipelines.flux.pipeline_flux import QEffFluxPipeline
+    from QEfficient.diffusers.pipelines.llada_image import QEffLLaDAImagePipeline
     from QEfficient.diffusers.pipelines.wan.pipeline_wan import QEffWanPipeline
     from QEfficient.diffusers.pipelines.wan.pipeline_wan_i2v import QEffWanImageToVideoPipeline
 except Exception:
     QEffFluxPipeline = None
+    QEffLLaDAImagePipeline = None
     QEffWanPipeline = None
     QEffWanImageToVideoPipeline = None
 
@@ -92,6 +94,8 @@ __all__ = [
 
 if QEffFluxPipeline is not None:
     __all__.append("QEffFluxPipeline")
+if QEffLLaDAImagePipeline is not None:
+    __all__.append("QEffLLaDAImagePipeline")
 if QEffWanPipeline is not None:
     __all__.append("QEffWanPipeline")
 if QEffWanImageToVideoPipeline is not None:

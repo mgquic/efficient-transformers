@@ -5,6 +5,7 @@
 #
 # ----------------------------------------------------------------------------
 
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
@@ -16,8 +17,10 @@ from QEfficient.diffusers.models.pytorch_transforms import (
     AttentionTransform,
     CLIPTextTransform,
     CustomOpsTransform,
+    LLaDAImageTransformerTransform,
     NormalizationTransform,
 )
+from QEfficient.diffusers.models.transformers.transformer_llada_image import QEffLLaDAImageDenoisingGraph
 from QEfficient.transformers.models.pytorch_transforms import (
     T5ModelTransform,
 )
@@ -266,10 +269,11 @@ class QEffVAE(QEFFBaseModel):
                 - output_names (List[str]): Names of model outputs
         """
         bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        latent_channels = getattr(self.model.config, "latent_channels", 16)
 
         # VAE decoder takes latent representation as input
         example_inputs = {
-            "latent_sample": torch.randn(bs, 16, latent_height, latent_width),
+            "latent_sample": torch.randn(bs, latent_channels, latent_height, latent_width),
             "return_dict": False,
         }
 
@@ -544,6 +548,148 @@ class QEffFluxTransformerModel(QEFFBaseModel):
             **compiler_options: Additional compiler options (e.g., num_cores, aic_num_of_activations)
         """
         self._compile(specializations=specializations, **compiler_options)
+
+
+class QEffLLaDAImageTransformer(QEFFBaseModel):
+    """Fixed-shape AIC adapter for one LLaDA-Image denoising mode."""
+
+    _pytorch_transforms = [LLaDAImageTransformerTransform, CustomOpsTransform]
+    _onnx_transforms = [FP16ClipTransform, SplitTensorsTransform]
+
+    def __init__(
+        self,
+        transformer: nn.Module,
+        *,
+        mode: str,
+        latent_height: int,
+        latent_width: int,
+        caption_length: int,
+        semantic_length: int = 0,
+        dynamic_resolution: bool = False,
+    ) -> None:
+        graph = QEffLLaDAImageDenoisingGraph(
+            transformer,
+            mode=mode,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            caption_length=caption_length,
+            semantic_length=semantic_length,
+            dynamic_resolution=dynamic_resolution,
+        )
+        super().__init__(graph, module_name=f"llada_image_dit_{mode}")
+        self.mode = mode
+        self.latent_height = int(latent_height)
+        self.latent_width = int(latent_width)
+        self.caption_length = int(caption_length)
+        self.semantic_length = int(semantic_length)
+        self.dynamic_resolution = bool(dynamic_resolution)
+        self.hash_params.update(
+            {
+                "llada_image_mode": mode,
+                "latent_height": self.latent_height,
+                "latent_width": self.latent_width,
+                "caption_length": self.caption_length,
+                "semantic_length": self.semantic_length,
+                "dynamic_resolution": self.dynamic_resolution,
+            }
+        )
+
+    @property
+    def get_model_config(self) -> Dict:
+        config = self.model.config.__dict__.copy()
+        name_or_path = config.get("_name_or_path")
+        if isinstance(name_or_path, Path):
+            config["_name_or_path"] = str(name_or_path)
+        return config
+
+    def get_onnx_params(self, batch_size: int = 1):
+        image_shape = (batch_size, self.model.config.in_channels, self.latent_height, self.latent_width)
+        model_dtype = next(self.model.parameters()).dtype
+        example_inputs = {
+            "hidden_states": torch.randn(image_shape, dtype=model_dtype),
+            "timestep": torch.ones((batch_size,), dtype=model_dtype),
+            "cap_feats": torch.randn(
+                (batch_size, self.caption_length, self.model.config.cap_feat_dim), dtype=model_dtype
+            ),
+            "cap_mask": torch.ones((batch_size, self.caption_length), dtype=torch.int64),
+        }
+        dynamic_axes = {name: {0: "batch_size"} for name in example_inputs}
+        if self.dynamic_resolution:
+            if self.mode != "text":
+                raise ValueError("Dynamic-resolution export currently supports text mode only")
+            rotary_dim = sum(int(value) for value in self.model.config.axes_dims) // 2
+            image_sequence_length = self.latent_height * self.latent_width
+            example_inputs.update(
+                {
+                    "image_rope_cos": torch.randn(image_sequence_length, rotary_dim, dtype=torch.float32),
+                    "image_rope_sin": torch.randn(image_sequence_length, rotary_dim, dtype=torch.float32),
+                    "caption_rope_cos": torch.randn(self.caption_length, rotary_dim, dtype=torch.float32),
+                    "caption_rope_sin": torch.randn(self.caption_length, rotary_dim, dtype=torch.float32),
+                }
+            )
+            dynamic_axes.update(
+                {
+                    "hidden_states": {0: "batch_size", 2: "latent_height", 3: "latent_width"},
+                    "image_rope_cos": {0: "image_sequence_length"},
+                    "image_rope_sin": {0: "image_sequence_length"},
+                    "sample": {0: "batch_size", 2: "latent_height", 3: "latent_width"},
+                }
+            )
+        if self.mode == "vq":
+            example_inputs["semantic_feats"] = torch.randn(
+                (batch_size, self.semantic_length, self.model.config.semantic_feat_dim), dtype=model_dtype
+            )
+            example_inputs["semantic_mask"] = torch.ones((batch_size, self.semantic_length), dtype=torch.int64)
+            dynamic_axes["semantic_feats"] = {0: "batch_size"}
+            dynamic_axes["semantic_mask"] = {0: "batch_size"}
+        elif self.mode == "editing":
+            example_inputs["semantic_feats"] = torch.randn(
+                (batch_size, self.semantic_length, self.model.config.semantic_feat_dim), dtype=model_dtype
+            )
+            example_inputs["semantic_mask"] = torch.ones((batch_size, self.semantic_length), dtype=torch.int64)
+            example_inputs["source_latents"] = torch.randn(image_shape, dtype=model_dtype)
+            dynamic_axes["semantic_feats"] = {0: "batch_size"}
+            dynamic_axes["semantic_mask"] = {0: "batch_size"}
+            dynamic_axes["source_latents"] = {0: "batch_size"}
+        return example_inputs, dynamic_axes, ["sample"]
+
+    def export(
+        self,
+        export_dir: str | None = None,
+        *,
+        batch_size: int = 1,
+        offload_pt_weights: bool = True,
+        use_onnx_subfunctions: bool = False,
+    ) -> str:
+        example_inputs, dynamic_axes, output_names = self.get_onnx_params(batch_size=batch_size)
+        return self._export(
+            example_inputs=example_inputs,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            export_dir=export_dir,
+            offload_pt_weights=offload_pt_weights,
+            dynamo=False,
+            use_onnx_subfunctions=use_onnx_subfunctions,
+        )
+
+    def compile(
+        self,
+        *,
+        onnx_path: str | None = None,
+        compile_dir: str | None = None,
+        batch_size: int = 1,
+        specializations: List[Dict[str, int]] | None = None,
+        **compiler_options,
+    ) -> str:
+        if specializations is None:
+            specializations = [{"batch_size": batch_size}]
+        return self._compile(
+            onnx_path=onnx_path,
+            compile_dir=compile_dir,
+            specializations=specializations,
+            offload_pt_weights=False,
+            **compiler_options,
+        )
 
 
 class QEffWanTransformer(QEFFBaseModel):

@@ -158,24 +158,29 @@ def compile_modules_parallel(
 
     def _prepare_and_compile(module_name: str, module_obj: Any) -> None:
         """Prepare specializations and compile a single module."""
-        specializations = config["modules"][module_name]["specializations"].copy()
+        configured_specializations = config["modules"][module_name]["specializations"]
+        if isinstance(configured_specializations, list):
+            specializations = [dict(specialization) for specialization in configured_specializations]
+        else:
+            specializations = [dict(configured_specializations)]
         compile_kwargs = config["modules"][module_name]["compilation"].copy()
         # Diffusion pipelines export modules before compile. Use that ONNX here
         # so compile does not re-export modules with incompatible export APIs.
         if compile_kwargs.get("onnx_path") is None:
             compile_kwargs["onnx_path"] = module_obj.onnx_path
 
-        if (
-            specialization_updates and module_name in specialization_updates
-        ):  # Apply specialization updates if available
-            if isinstance(specializations, list):  # for unified models spec will be [{high_noise}, {low_noise}]
-                for i, spec in enumerate(specializations):
-                    spec.update(specialization_updates[module_name][i])
+        if specialization_updates and module_name in specialization_updates:
+            updates = specialization_updates[module_name]
+            if isinstance(updates, list):
+                if len(updates) != len(specializations):
+                    raise ValueError(
+                        f"Specialization update count for {module_name} does not match its configured count"
+                    )
+                for specialization, update in zip(specializations, updates):
+                    specialization.update(update)
             else:
-                specializations.update(specialization_updates[module_name])
-                specializations = [specializations]
-        else:
-            specializations = [specializations]
+                for specialization in specializations:
+                    specialization.update(updates)
 
         # Tag each spec with the module name so _compile knows the graph name.
         specializations = [
@@ -221,24 +226,29 @@ def compile_modules_sequential(
     """
     for module_name, module_obj in tqdm(modules.items(), desc="Compiling modules", unit="module"):
         module_config = config["modules"]
-        specializations = module_config[module_name]["specializations"].copy()
+        configured_specializations = module_config[module_name]["specializations"]
+        if isinstance(configured_specializations, list):
+            specializations = [dict(specialization) for specialization in configured_specializations]
+        else:
+            specializations = [dict(configured_specializations)]
         compile_kwargs = module_config[module_name]["compilation"].copy()
         # Diffusion pipelines export modules before compile. Use that ONNX here
         # so compile does not re-export modules with incompatible export APIs.
         if compile_kwargs.get("onnx_path") is None:
             compile_kwargs["onnx_path"] = module_obj.onnx_path
 
-        if (
-            specialization_updates and module_name in specialization_updates
-        ):  # Apply specialization updates if available
-            if isinstance(specializations, list):  # for unified models spec will be [{high_noise}, {low_noise}]
-                for i, spec in enumerate(specializations):
-                    spec.update(specialization_updates[module_name][i])
+        if specialization_updates and module_name in specialization_updates:
+            updates = specialization_updates[module_name]
+            if isinstance(updates, list):
+                if len(updates) != len(specializations):
+                    raise ValueError(
+                        f"Specialization update count for {module_name} does not match its configured count"
+                    )
+                for specialization, update in zip(specializations, updates):
+                    specialization.update(update)
             else:
-                specializations.update(specialization_updates[module_name])
-                specializations = [specializations]
-        else:
-            specializations = [specializations]
+                for specialization in specializations:
+                    specialization.update(updates)
 
         # Tag each spec with the module name so _compile knows the graph name.
         specializations = [

@@ -1,0 +1,87 @@
+{
+  "description": "Default configuration for the LLaDA-Image text pipeline",
+  "use_onnx_subfunctions": false,
+  "modules": {
+    "composite_text_encoder": {
+      "specializations": {
+        "batch_size": 1
+      },
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 16,
+        "mxfp6_matmul": true,
+        "convert_to_fp16": true,
+        "aic_num_cores": 16,
+        "allow_mxint8_mdp_io": true,
+        "mos": 1,
+        "mdts_mos": 1,
+        "node_precision_info": false
+      },
+      "execute": {
+        "device_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "qpc_path": null
+      }
+    },
+    "dit": {
+      "specializations": [
+        {
+          "batch_size": 1,
+          "image_sequence_length": 256,
+          "latent_height": 16,
+          "latent_width": 16
+        },
+        {
+          "batch_size": 1,
+          "image_sequence_length": 4096,
+          "latent_height": 64,
+          "latent_width": 64
+        }
+      ],
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 16,
+        "mxfp6_matmul": true,
+        "convert_to_fp16": true,
+        "aic_num_cores": 16,
+        "allow_mxint8_mdp_io": true,
+        "mos": 1,
+        "mdts_mos": 1
+      },
+      "execute": {
+        "device_ids": [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+        "qpc_path": null
+      }
+    },
+    "vae_decoder": {
+      "specializations": [
+        {
+          "batch_size": 1,
+          "channels": 32,
+          "latent_height": 32,
+          "latent_width": 32
+        },
+        {
+          "batch_size": 1,
+          "channels": 32,
+          "latent_height": 128,
+          "latent_width": 128
+        }
+      ],
+      "compilation": {
+        "onnx_path": null,
+        "compile_dir": null,
+        "mdp_ts_num_devices": 1,
+        "mxfp6_matmul": false,
+        "convert_to_fp16": true,
+        "aic_num_cores": 16,
+        "aic_enable_depth_first": true
+      },
+      "execute": {
+        "device_ids": null,
+        "qpc_path": null
+      }
+    }
+  }
+}
