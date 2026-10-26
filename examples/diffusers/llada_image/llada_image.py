@@ -8,6 +8,7 @@ deployment configuration.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -44,14 +45,6 @@ if MODEL_PATH is None:
         HF_HUB_CACHE = local_model.parents[2]
     else:
         MODEL_PATH = MODEL_REPO
-WORK_ROOT = Path(os.environ.get("LLADA_WORK_ROOT", str(DEFAULT_WORK_ROOT))).expanduser().resolve()
-OUTPUT = Path(
-    os.environ.get(
-        "LLADA_OUTPUT",
-        str(WORK_ROOT / "llada_image_1024.png"),
-    )
-)
-
 sys.path.insert(0, str(REPO_ROOT))
 os.environ["PATH"] = os.pathsep.join(filter(None, ["/opt/qti-aic/exec", os.environ.get("PATH", "")]))
 os.environ["PYTHONPATH"] = os.pathsep.join(
@@ -70,17 +63,44 @@ os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
 )
 os.environ["HF_HUB_CACHE"] = str(HF_HUB_CACHE)
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-os.environ["QEFF_HOME"] = str(WORK_ROOT)
 
-if WORK_ROOT.exists() and any(WORK_ROOT.iterdir()) and not (WORK_ROOT / "manifest.json").is_file():
-    raise RuntimeError(
-        f"Refusing to reuse existing e2e artifacts: {WORK_ROOT}. "
-        "Use a new empty directory or remove the incomplete directory explicitly."
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--partial-layers",
+        action="store_true",
+        help=(
+            "Keep only first/last repeated blocks in the fused encoder, DiT, "
+            "and VAE decoder for export/compile latency tests."
+        ),
     )
-WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    return parser.parse_args()
+
+
+def _prepare_work_root(partial_layers: bool) -> tuple[Path, Path]:
+    default_root = DEFAULT_WORK_ROOT / "partial_2layer" if partial_layers else DEFAULT_WORK_ROOT
+    work_root = Path(os.environ.get("LLADA_WORK_ROOT", str(default_root))).expanduser().resolve()
+    output = Path(
+        os.environ.get(
+            "LLADA_OUTPUT",
+            str(work_root / "llada_image_1024.png"),
+        )
+    ).expanduser().resolve()
+
+    os.environ["QEFF_HOME"] = str(work_root)
+    if work_root.exists() and any(work_root.iterdir()) and not (work_root / "manifest.json").is_file():
+        raise RuntimeError(
+            f"Refusing to reuse existing e2e artifacts: {work_root}. "
+            "Use a new empty directory or remove the incomplete directory explicitly."
+        )
+    work_root.mkdir(parents=True, exist_ok=True)
+    return work_root, output
 
 
 def main() -> None:
+    args = _parse_args()
+    work_root, output_path = _prepare_work_root(args.partial_layers)
     import torch
 
     from QEfficient import QEffLLaDAImagePipeline
@@ -91,7 +111,15 @@ def main() -> None:
         composite_text_encoder_implementation="default",
     )
 
-    output = pipeline(
+    if args.partial_layers:
+        from QEfficient.diffusers.pipelines.llada_image.partial_layers import (
+            truncate_llada_image_pipeline,
+        )
+
+        partial_report = truncate_llada_image_pipeline(pipeline)
+        print(f"Using partial first/last-layer export mode; report: {partial_report}")
+
+    result = pipeline(
         prompt="A man drawing potrait of Mahatma Gandhi",
         height=int(os.environ.get("LLADA_HEIGHT", "1024")),
         width=int(os.environ.get("LLADA_WIDTH", "1024")),
@@ -100,14 +128,13 @@ def main() -> None:
         max_sequence_length=256,
         generator=torch.Generator("cpu").manual_seed(42),
         custom_config_path=str(COMPILE_CONFIG),
-        work_root=str(WORK_ROOT),
+        work_root=str(work_root),
         parallel_compile=os.environ.get("LLADA_PARALLEL_COMPILE", "0") == "1",
         use_onnx_subfunctions=False,
     )
 
-    output_path = OUTPUT.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output.images[0].save(output_path)
+    result.images[0].save(output_path)
     print(f"Saved image to {output_path}")
     print(getattr(pipeline, "last_timings", {}))
 

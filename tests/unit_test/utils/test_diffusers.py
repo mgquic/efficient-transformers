@@ -1899,3 +1899,134 @@ class TestFluxTransformerBlocks:
                     f"Expected QEffFluxAttnProcessor, got {type(m.processor)}"
                 )
                 break
+
+
+@pytest.mark.diffusers
+class TestLLaDAImagePartialLayers:
+    """Reduced-depth export surgery keeps the graph structurally valid."""
+
+    def test_partial_layers_keep_first_and_last_repeated_blocks(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image.partial_layers import (
+            truncate_llada_image_pipeline,
+        )
+
+        def module_list(length):
+            return torch.nn.ModuleList([torch.nn.Identity() for _ in range(length)])
+
+        class LanguageModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = module_list(6)
+
+        class TextEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = LanguageModel()
+
+        class QueryFormer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.query_blocks = module_list(5)
+
+        class TextProjection(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = module_list(5)
+
+        class Dit(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.noise_refiner = module_list(4)
+                self.context_refiner = module_list(4)
+                self.sigvq_refiner = module_list(4)
+                self.layers = module_list(6)
+
+        class DecoderBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.resnets = module_list(4)
+                self.attentions = module_list(4)
+                self.upsamplers = module_list(1)
+
+        class MidBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.resnets = module_list(5)
+                self.attentions = module_list(4)
+
+        class Decoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mid_block = MidBlock()
+                self.up_blocks = torch.nn.ModuleList([DecoderBlock(), DecoderBlock()])
+
+        model = SimpleNamespace(
+            queryformer=QueryFormer(),
+            text_encoder=TextEncoder(),
+            text_projection=TextProjection(),
+            transformer=Dit(),
+            vae=SimpleNamespace(decoder=Decoder()),
+        )
+
+        report = truncate_llada_image_pipeline(SimpleNamespace(model=model))
+
+        assert len(model.queryformer.query_blocks) == 2
+        assert len(model.text_encoder.language_model.layers) == 2
+        assert len(model.text_projection.layers) == 2
+        assert len(model.transformer.layers) == 2
+        assert len(model.transformer.noise_refiner) == 2
+        assert len(model.vae.decoder.mid_block.resnets) == 3
+        assert len(model.vae.decoder.mid_block.attentions) == 2
+        assert all(len(block.resnets) == 2 for block in model.vae.decoder.up_blocks)
+        assert all(len(block.attentions) == 2 for block in model.vae.decoder.up_blocks)
+        assert all(len(block.upsamplers) == 1 for block in model.vae.decoder.up_blocks)
+        assert report["dit"]["layers"] == {"before": 6, "after": 2}
+
+    def test_partial_layers_is_idempotent(self):
+        from types import SimpleNamespace
+
+        from QEfficient.diffusers.pipelines.llada_image.partial_layers import (
+            truncate_llada_image_pipeline,
+        )
+
+        class Repeated(torch.nn.Module):
+            def __init__(self, length):
+                super().__init__()
+                self.query_blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(length)])
+                self.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(length)])
+
+        class Decoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mid_block = torch.nn.Module()
+                self.mid_block.resnets = torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)])
+                self.mid_block.attentions = torch.nn.ModuleList([torch.nn.Identity()])
+                self.up_blocks = torch.nn.ModuleList()
+
+        class TextEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.language_model = torch.nn.Module()
+                self.language_model.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)])
+
+        repeated = Repeated(2)
+        model = SimpleNamespace(
+            queryformer=repeated,
+            text_encoder=TextEncoder(),
+            text_projection=repeated,
+            transformer=SimpleNamespace(
+                noise_refiner=torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)]),
+                context_refiner=torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)]),
+                sigvq_refiner=torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)]),
+                layers=torch.nn.ModuleList([torch.nn.Identity() for _ in range(2)]),
+            ),
+            vae=SimpleNamespace(decoder=Decoder()),
+        )
+
+        truncate_llada_image_pipeline(SimpleNamespace(model=model))
+        truncate_llada_image_pipeline(SimpleNamespace(model=model))
+
+        assert len(model.queryformer.query_blocks) == 2
+        assert len(model.text_encoder.language_model.layers) == 2
